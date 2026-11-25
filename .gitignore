@@ -1,0 +1,16 @@
+# Runtime state (never commit these)
+runtime/
+whisper-venv/
+models/
+__pycache__/
+*.pyc
+*.log
+*.pid
+*.lock
+handled.txt
+inbox.jsonl
+state.json
+poller-state.json
+downloads/
+transcripts/
+.env
