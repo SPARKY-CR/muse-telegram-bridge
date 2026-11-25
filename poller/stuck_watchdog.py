@@ -20,10 +20,18 @@ conditional. Pure script: no agent turn, no tokens.
 
 Usage: stuck_watchdog.py <chat_id> <chat_id:message_id>
        [--threshold 300] [--interval 15] [--max-secs 7200]
+       [--runtime-dir DIR]
 
 Best-effort like typing_keeper.py: never raises, logs start/stop and
 the hint to stuck_watchdog.log, and a second watchdog for the same
-message exits at once (pidfile in /tmp).
+message exits at once (flock on a lock file under the runtime dir,
+named by a hash of the key — no predictable /tmp pidfiles).
+
+The handled.txt check is mtime-cached. The runtime dir is passed
+explicitly (--runtime-dir) so the watchdog always watches the same
+handled.txt the agent writes, wherever the scripts live. The hint
+sets allow_sending_without_reply so a deleted original message
+cannot fail the hint.
 """
 
 import argparse
@@ -31,11 +39,10 @@ import os
 import sys
 import time
 
-WEBHOOK_DIR = os.path.dirname(os.path.abspath(__file__))
-HANDLED = os.path.join(WEBHOOK_DIR, "handled.txt")
-LOG = os.path.join(WEBHOOK_DIR, "stuck_watchdog.log")
-
-sys.path.insert(0, os.path.join(WEBHOOK_DIR, "..", "bin"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "bin"))
+sys.path.insert(0, SCRIPT_DIR)
+import bridge_common  # noqa: E402
 import telegram  # noqa: E402
 
 HINT = os.environ.get(
@@ -45,55 +52,39 @@ HINT = os.environ.get(
     "tap it so I can continue.")
 
 
-def log(msg):
-    try:
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + msg + "\n")
-    except OSError:
-        pass
-
-
-def is_handled(key):
-    try:
-        with open(HANDLED, encoding="utf-8") as f:
-            return key in {line.strip() for line in f}
-    except OSError:
-        return False
-
-
-def already_running(key):
-    pidfile = "/tmp/tg-stuck-%s.pid" % key.replace(":", "_")
-    try:
-        with open(pidfile, encoding="utf-8") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        pass
-    try:
-        with open(pidfile, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    return False
-
-
 def main():
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description="Telegram stuck watchdog")
     parser.add_argument("chat_id")
     parser.add_argument("key", help="chat_id:message_id")
     parser.add_argument("--threshold", type=float, default=300.0)
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--max-secs", type=float, default=7200.0)
+    parser.add_argument("--runtime-dir", default=None,
+                        help="Runtime dir for handled.txt, logs, locks "
+                             "(default: the script's directory)")
     args = parser.parse_args()
 
     try:
         message_id = int(args.key.split(":", 1)[1])
     except (IndexError, ValueError):
-        log("bad key %r" % args.key)
         return 2
 
-    if already_running(args.key):
+    runtime_dir = os.path.abspath(args.runtime_dir or SCRIPT_DIR)
+    handled = bridge_common.HandledSet(
+        os.path.join(runtime_dir, "handled.txt"))
+    log_path = os.path.join(runtime_dir, "stuck_watchdog.log")
+
+    def log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + msg + "\n")
+        except OSError:
+            pass
+
+    lock = bridge_common.acquire_singleton(
+        os.path.join(runtime_dir, "locks"), "stuck:" + args.key)
+    if lock is None:
         log("skip %s watchdog already running" % args.key)
         return 0
     log("start %s chat=%s" % (args.key, args.chat_id))
@@ -101,7 +92,7 @@ def main():
     hint_at = time.time() + args.threshold
     hint_sent = False
     while time.time() < deadline:
-        if is_handled(args.key):
+        if handled.contains(args.key):
             log("stop %s handled" % args.key)
             return 0
         if not hint_sent and time.time() >= hint_at:
@@ -110,6 +101,7 @@ def main():
                     "chat_id": args.chat_id,
                     "text": HINT,
                     "reply_to_message_id": message_id,
+                    "allow_sending_without_reply": True,
                 }, timeout=15)
                 log("hint sent for %s" % args.key)
             except Exception as exc:  # noqa: BLE001 - watchdog is best-effort
