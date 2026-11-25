@@ -362,7 +362,15 @@ class _HTMLSanitizer(html.parser.HTMLParser):
             return
         if tag not in _ALLOWED_HTML_TAGS:
             return
-        self.parts.append(f"<{tag}>")
+        attr_text = ""
+        attr_map = {str(k).lower(): v for k, v in attrs}
+        if tag == "blockquote" and "expandable" in attr_map:
+            attr_text = " expandable"
+        elif tag == "code":
+            cls = attr_map.get("class") or ""
+            if re.fullmatch(r"language-[a-z0-9+#-]+", cls):
+                attr_text = f' class="{cls}"'
+        self.parts.append(f"<{tag}{attr_text}>")
         self.stack.append(tag)
 
     def handle_startendtag(self, tag, attrs):
@@ -1076,6 +1084,57 @@ def _load_entries(path):
     return entries if isinstance(entries, dict) else {}
 
 
+_DAILY_COUNT_KEY_RE = re.compile(r"^(confirm|quiz):\d{4}-\d{2}-\d{2}$")
+
+
+def _load_ui_state(path):
+    """Load UI entries plus the persistent daily-cap counters.
+
+    The counters live beside the entries in ui-state.json so
+    one atomic write updates both. Entry GC never touches
+    them: a daily cap must count creations for the whole
+    local day, not only entries still inside their TTL.
+    Malformed counter keys/values are dropped rather than
+    crashing the helper; the atomic writer keeps a torn
+    write from producing a half-valid file in the first
+    place."""
+    data = bridge_common.load_json_file(path) or {}
+    entries = data.get("entries")
+    entries = entries if isinstance(entries, dict) else {}
+    daily_counts = {}
+    raw_counts = data.get("daily_counts")
+    if isinstance(raw_counts, dict):
+        for key, value in raw_counts.items():
+            if isinstance(key, str) \
+                    and _DAILY_COUNT_KEY_RE.match(key) \
+                    and isinstance(value, int) \
+                    and not isinstance(value, bool) and value >= 0:
+                daily_counts[key] = value
+    return entries, daily_counts
+
+
+def _save_ui_state(path, entries, daily_counts):
+    bridge_common.atomic_write_json(
+        path, {"entries": entries, "daily_counts": daily_counts})
+
+
+def _daily_count_key(kind, current):
+    return f"{kind}:{time.strftime('%Y-%m-%d', time.localtime(current))}"
+
+
+def _seed_daily_count(entries, kind, current):
+    """Best-effort upgrade seed from live entries created
+    today, used only when no counter exists yet (state
+    written before daily counters were stored)."""
+    today = time.localtime(current)[:3]
+    return sum(
+        1 for e in entries.values()
+        if isinstance(e, dict) and e.get("kind") == kind
+        and isinstance(e.get("created_at"), (int, float))
+        and not isinstance(e.get("created_at"), bool)
+        and time.localtime(e["created_at"])[:3] == today)
+
+
 def _gc_ui_entries(entries, now):
     kept = {}
     for entry_id, entry in entries.items():
@@ -1140,8 +1199,88 @@ def _ui_entry_valid(entry, kind, chat_id, message_id, payload_hash,
     return True
 
 
+MAX_OPEN_CONFIRMS = 3
+DAILY_CONFIRM_CAP = 20
+DAILY_QUIZ_CAP = 20
+
+
+def _owner_id(runtime_dir=None):
+    for env in ("BRIDGE_CHAT_ID", "TELEGRAM_CHAT_ID"):
+        parsed = _parse_any_chat_id(os.environ.get(env, ""))
+        if parsed is not None:
+            return parsed
+    config = bridge_common.load_json_file(
+        _runtime_file("config.json", runtime_dir,
+                      "TELEGRAM_CONFIG_FILE")) or {}
+    return _parse_any_chat_id(config.get("chat_id"))
+
+
+def _derive_source_turn_class(source_key, runtime_dir=None):
+    """Derive the turn class of the inbox entry named by
+    source_key (``chat:message`` or ``chat:cb:callback_id``)
+    by classifying the raw update itself. Returns the class,
+    or None when the entry cannot be found or classified.
+    The worker never supplies this value: a media/data turn
+    is read-only because the update says so, not because the
+    worker remembered to pass a flag."""
+    if not isinstance(source_key, str) or not source_key.strip():
+        return None
+    parts = source_key.strip().split(":")
+    if len(parts) == 2:
+        chat_id = _parse_any_chat_id(parts[0])
+        try:
+            message_id = int(parts[1])
+        except ValueError:
+            return None
+        callback_id = None
+    elif len(parts) == 3 and parts[1] == "cb":
+        chat_id = _parse_any_chat_id(parts[0])
+        message_id = None
+        callback_id = parts[2]
+    else:
+        return None
+    if chat_id is None:
+        return None
+    owner = _owner_id(runtime_dir)
+    if owner is None:
+        return None
+    path = _runtime_file("inbox.jsonl", runtime_dir,
+                         "TELEGRAM_INBOX_FILE")
+    try:
+        with open(path, "rb") as fh:
+            raw_lines = fh.read().splitlines()
+    except OSError:
+        return None
+    for raw in raw_lines:
+        try:
+            update = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(update, dict):
+            continue
+        if callback_id is not None:
+            cb = update.get("callback_query")
+            if not isinstance(cb, dict) \
+                    or cb.get("id") != callback_id:
+                continue
+        else:
+            msg = update.get("message")
+            if not isinstance(msg, dict) \
+                    or msg.get("message_id") != message_id:
+                continue
+            chat = msg.get("chat")
+            if not isinstance(chat, dict) \
+                    or chat.get("id") != chat_id:
+                continue
+        _kind, payload = bridge_common.classify(update, owner)
+        if isinstance(payload, dict):
+            return payload.get("turn_class")
+        return None
+    return None
+
+
 def ui_put(kind, data, chat_id, message_id=None, ttl_secs=1800,
-           runtime_dir=None, now=None):
+           runtime_dir=None, now=None, source_key=None):
     """Store one short-lived UI-state entry and return it.
 
     The id is 128 random bits. The entry binds kind, chat,
@@ -1171,6 +1310,26 @@ def ui_put(kind, data, chat_id, message_id=None, ttl_secs=1800,
             "ui_put refused: confirm entries bind with ui_bind "
             "after the preview is sent")
     current = time.time() if now is None else float(now)
+    derived_turn = None
+    if kind == "confirm":
+        if not isinstance(source_key, str) or not source_key.strip():
+            raise ValueError(
+                "ui_put refused: confirm requires source_key")
+        derived_turn = _derive_source_turn_class(
+            source_key, runtime_dir)
+        if derived_turn in READONLY_TURN_CLASSES:
+            raise ValueError(
+                "ui_put refused: read-only turn cannot create "
+                "a confirmation")
+        if derived_turn is None:
+            raise ValueError(
+                "ui_put refused: unknown source entry")
+        if isinstance(data, dict):
+            data = dict(data)
+            data["source_turn_class"] = derived_turn
+    elif source_key is not None:
+        derived_turn = _derive_source_turn_class(
+            source_key, runtime_dir)
     entry_id = secrets.token_hex(16)
     entry = {
         "id": entry_id,
@@ -1181,6 +1340,7 @@ def ui_put(kind, data, chat_id, message_id=None, ttl_secs=1800,
         "created_at": current,
         "expires_at": current + float(ttl_secs),
         "consumed": False,
+        "source_turn_class": derived_turn,
         "payload_hash": _payload_hash(data),
         "data": data,
     }
@@ -1191,12 +1351,44 @@ def ui_put(kind, data, chat_id, message_id=None, ttl_secs=1800,
     lock_file = open(path + ".lock", "a", encoding="utf-8")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        entries = _gc_ui_entries(_load_entries(path), current)
+        loaded_entries, daily_counts = _load_ui_state(path)
+        entries = _gc_ui_entries(loaded_entries, current)
+        daily_cap = {"confirm": DAILY_CONFIRM_CAP,
+                     "quiz": DAILY_QUIZ_CAP}.get(kind)
+        daily_key = None
+        if daily_cap is not None:
+            daily_key = _daily_count_key(kind, current)
+            if daily_key not in daily_counts:
+                daily_counts[daily_key] = _seed_daily_count(
+                    entries, kind, current)
+            if daily_counts[daily_key] >= daily_cap:
+                _save_ui_state(path, entries, daily_counts)
+                raise ValueError(
+                    f"ui_put refused: daily {kind} cap reached")
+        replaced = []
+        if kind == "confirm":
+            open_confirms = sorted(
+                (e for e in entries.values()
+                 if isinstance(e, dict)
+                 and e.get("kind") == "confirm"
+                 and not e.get("consumed")),
+                key=lambda e: e.get("created_at") or 0)
+            while len(open_confirms) >= MAX_OPEN_CONFIRMS:
+                oldest = dict(open_confirms.pop(0))
+                oldest["expires_at"] = current
+                oldest["expired_by_cap"] = True
+                entries[oldest["id"]] = oldest
+                replaced.append(oldest["id"])
         entries[entry_id] = entry
-        bridge_common.atomic_write_json(path, {"entries": entries})
+        if daily_key is not None:
+            daily_counts[daily_key] = daily_counts.get(daily_key, 0) + 1
+        _save_ui_state(path, entries, daily_counts)
     finally:
         lock_file.close()
-    return dict(entry)
+    result = dict(entry)
+    if replaced:
+        result["replaced"] = replaced
+    return result
 
 
 def ui_bind(entry_id, message_id, chat_id=None, runtime_dir=None,
@@ -1225,19 +1417,19 @@ def ui_bind(entry_id, message_id, chat_id=None, runtime_dir=None,
     lock_file = open(path + ".lock", "a", encoding="utf-8")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        entries = _gc_ui_entries(_load_entries(path), current)
+        loaded_entries, daily_counts = _load_ui_state(path)
+        entries = _gc_ui_entries(loaded_entries, current)
         entry = entries.get(entry_id)
         if not isinstance(entry, dict) or entry.get("consumed"):
-            bridge_common.atomic_write_json(path, {"entries": entries})
+            _save_ui_state(path, entries, daily_counts)
             return None
         if chat_id is not None:
             parsed = _parse_any_chat_id(chat_id)
             if parsed is None or entry.get("chat_id") != parsed:
-                bridge_common.atomic_write_json(
-                    path, {"entries": entries})
+                _save_ui_state(path, entries, daily_counts)
                 return None
         if _entry_bound(entry):
-            bridge_common.atomic_write_json(path, {"entries": entries})
+            _save_ui_state(path, entries, daily_counts)
             if entry.get("message_id") == message_id:
                 return dict(entry)
             return None
@@ -1246,7 +1438,7 @@ def ui_bind(entry_id, message_id, chat_id=None, runtime_dir=None,
         entry["bound"] = True
         entry["bound_at"] = current
         entries[entry_id] = entry
-        bridge_common.atomic_write_json(path, {"entries": entries})
+        _save_ui_state(path, entries, daily_counts)
         return dict(entry)
     finally:
         lock_file.close()
@@ -1284,22 +1476,23 @@ def ui_consume(entry_id, kind=None, chat_id=None, message_id=None,
     lock_file = open(path + ".lock", "a", encoding="utf-8")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        entries = _gc_ui_entries(_load_entries(path), current)
+        loaded_entries, daily_counts = _load_ui_state(path)
+        entries = _gc_ui_entries(loaded_entries, current)
         entry = entries.get(entry_id)
         if isinstance(entry, dict) \
                 and entry.get("kind") == "confirm":
-            bridge_common.atomic_write_json(path, {"entries": entries})
+            _save_ui_state(path, entries, daily_counts)
             return None
         if chat_id is None or not _ui_entry_valid(
                 entry, kind, chat_id, message_id, payload_hash,
                 current, require_bound=True):
-            bridge_common.atomic_write_json(path, {"entries": entries})
+            _save_ui_state(path, entries, daily_counts)
             return None
         entry = dict(entry)
         entry["consumed"] = True
         entry["consumed_at"] = current
         entries[entry_id] = entry
-        bridge_common.atomic_write_json(path, {"entries": entries})
+        _save_ui_state(path, entries, daily_counts)
         return dict(entry)
     finally:
         lock_file.close()
@@ -1428,7 +1621,8 @@ def confirm_begin(entry_id, kind="confirm", chat_id=None,
     ui_lock = open(ui_path + ".lock", "a", encoding="utf-8")
     try:
         fcntl.flock(ui_lock, fcntl.LOCK_EX)
-        entries = _gc_ui_entries(_load_entries(ui_path), current)
+        loaded_entries, daily_counts = _load_ui_state(ui_path)
+        entries = _gc_ui_entries(loaded_entries, current)
         entry = entries.get(entry_id)
         payload = entry.get("data") if isinstance(entry, dict) \
             else None
@@ -1437,21 +1631,18 @@ def confirm_begin(entry_id, kind="confirm", chat_id=None,
                                require_bound=True) \
                 or _payload_hash(payload) != entry.get(
                     "payload_hash"):
-            bridge_common.atomic_write_json(
-                ui_path, {"entries": entries})
+            _save_ui_state(ui_path, entries, daily_counts)
             return None
-        source_turn = turn_class
+        source_turn = entry.get("source_turn_class") or turn_class
         if isinstance(payload, dict) and payload.get(
                 "source_turn_class") in READONLY_TURN_CLASSES:
             source_turn = payload.get("source_turn_class")
         if source_turn in READONLY_TURN_CLASSES:
-            bridge_common.atomic_write_json(
-                ui_path, {"entries": entries})
+            _save_ui_state(ui_path, entries, daily_counts)
             return {"begun": False, "reason": "media_readonly",
                     "entry_id": entry_id, "action_id": action_id}
         if settings_get(runtime_dir).get("locked"):
-            bridge_common.atomic_write_json(
-                ui_path, {"entries": entries})
+            _save_ui_state(ui_path, entries, daily_counts)
             return {"begun": False, "reason": "locked",
                     "entry_id": entry_id, "action_id": action_id}
         ledger_lock = open(ledger_path + ".lock", "a",
@@ -1465,8 +1656,7 @@ def confirm_begin(entry_id, kind="confirm", chat_id=None,
             consumed["consumed_at"] = current
             entries[entry_id] = consumed
             if isinstance(existing, dict):
-                bridge_common.atomic_write_json(
-                    ui_path, {"entries": entries})
+                _save_ui_state(ui_path, entries, daily_counts)
                 state = existing.get("state", "reserved")
                 return {"begun": False, "entry_id": entry_id,
                         "action_id": action_id,
@@ -1488,8 +1678,7 @@ def confirm_begin(entry_id, kind="confirm", chat_id=None,
             # silent duplicate execution.
             bridge_common.atomic_write_json(
                 ledger_path, {"entries": ledger})
-            bridge_common.atomic_write_json(
-                ui_path, {"entries": entries})
+            _save_ui_state(ui_path, entries, daily_counts)
             return {"begun": True, "entry_id": entry_id,
                     "action_id": action_id, "payload": payload,
                     "payload_hash": entry.get("payload_hash"),
@@ -1683,6 +1872,7 @@ def main(argv=None):
                                "they bind with ui_bind)")
     p_ui_put.add_argument("--data-json", required=True)
     p_ui_put.add_argument("--ttl-secs", type=float, default=1800)
+    p_ui_put.add_argument("--source-key", default=None)
     p_ui_put.add_argument("--runtime-dir", default=None)
 
     p_ui_bind = sub.add_parser(
@@ -1862,12 +2052,14 @@ def main(argv=None):
             entry = ui_put(args.kind, json.loads(args.data_json),
                            args.chat_id, args.message_id,
                            ttl_secs=args.ttl_secs,
-                           runtime_dir=args.runtime_dir)
+                           runtime_dir=args.runtime_dir,
+                           source_key=args.source_key)
             result = {"ok": True, "result": {
                 "id": entry["id"],
                 "payload_hash": entry["payload_hash"],
                 "expires_at": entry["expires_at"],
                 "bound": entry["bound"],
+                "replaced": entry.get("replaced", []),
             }}
         elif args.command == "ui_bind":
             entry = ui_bind(args.entry_id, args.message_id,

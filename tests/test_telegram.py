@@ -628,6 +628,18 @@ class TestBridgeStatus(unittest.TestCase):
 
 
 class TestUiStateLedgerSettings(unittest.TestCase):
+    def _typed_source(self, d, message_id=11):
+        with open(os.path.join(d, "config.json"), "w") as fh:
+            json.dump({"chat_id": 111111111}, fh)
+        typed = {"update_id": 2, "message": {
+            "message_id": message_id, "date": 1001,
+            "from": {"id": 111111111},
+            "chat": {"id": 111111111, "type": "private"},
+            "text": "remind me"}}
+        with open(os.path.join(d, "inbox.jsonl"), "w") as fh:
+            fh.write(json.dumps(typed) + "\n")
+        return f"111111111:{message_id}"
+
     def test_ui_consume_once_and_replay_refused(self):
         with tempfile.TemporaryDirectory() as d:
             entry = telegram.ui_put(
@@ -692,7 +704,8 @@ class TestUiStateLedgerSettings(unittest.TestCase):
                        "source_turn_class": "typed"}
             entry = telegram.ui_put(
                 "confirm", payload, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             telegram.ui_bind(entry["id"], 42, runtime_dir=d,
                              now=1000.5)
             self.assertIsNone(telegram.confirm_begin(
@@ -723,7 +736,8 @@ class TestUiStateLedgerSettings(unittest.TestCase):
             payload = {"action": "note", "text": "hello"}
             entry = telegram.ui_put(
                 "confirm", payload, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             telegram.ui_bind(entry["id"], 9, runtime_dir=d,
                              now=1000.5)
             self.assertTrue(telegram.action_reserve(
@@ -746,13 +760,23 @@ class TestUiStateLedgerSettings(unittest.TestCase):
                     "entry-media", payload, runtime_dir=d,
                     now=1000.0, turn_class="media_readonly")
             entry = telegram.ui_put(
-                "confirm", payload, 111111111,
-                runtime_dir=d, now=1000.0)
+                "confirm", {"action": "note", "text": "hello"},
+                111111111, runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             telegram.ui_bind(entry["id"], 3, runtime_dir=d,
                              now=1000.5)
+            state_path = os.path.join(d, "ui-state.json")
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            stored = state["entries"][entry["id"]]
+            stored["data"]["source_turn_class"] = "media_readonly"
+            stored["payload_hash"] = telegram._payload_hash(
+                stored["data"])
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
             begun = telegram.confirm_begin(
                 entry["id"], chat_id=111111111, message_id=3,
-                payload_hash=entry["payload_hash"], runtime_dir=d,
+                payload_hash=stored["payload_hash"], runtime_dir=d,
                 now=1001.0, turn_class="callback")
             self.assertFalse(begun["begun"])
             self.assertEqual(begun["reason"], "media_readonly")
@@ -767,10 +791,12 @@ class TestUiStateLedgerSettings(unittest.TestCase):
                        "source_turn_class": "typed"}
             with self.assertRaises(ValueError):
                 telegram.ui_put("confirm", payload, 111111111, 100,
-                                runtime_dir=d, now=1000.0)
+                                runtime_dir=d, now=1000.0,
+                                source_key=self._typed_source(d))
             entry = telegram.ui_put(
                 "confirm", payload, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             self.assertFalse(entry["bound"])
             # Unbound: no confirm validates yet, with or
             # without a message id.
@@ -813,7 +839,8 @@ class TestUiStateLedgerSettings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             entry = telegram.ui_put(
                 "confirm", {"action": "note"}, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             self.assertIsNone(telegram.ui_bind(
                 "missing", 200, runtime_dir=d, now=1001.0))
             self.assertIsNone(telegram.ui_bind(
@@ -840,7 +867,8 @@ class TestUiStateLedgerSettings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             entry = telegram.ui_put(
                 "confirm", {"action": "note"}, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             telegram.ui_bind(entry["id"], 200, runtime_dir=d,
                              now=1000.5)
             state_path = os.path.join(d, "ui-state.json")
@@ -859,7 +887,8 @@ class TestUiStateLedgerSettings(unittest.TestCase):
             payload = {"action": "note", "text": "hello"}
             entry = telegram.ui_put(
                 "confirm", payload, 111111111,
-                runtime_dir=d, now=1000.0)
+                runtime_dir=d, now=1000.0,
+                source_key=self._typed_source(d))
             telegram.ui_bind(entry["id"], 55, runtime_dir=d,
                              now=1000.5)
             # A confirm entry never consumes through ui_consume,
@@ -882,6 +911,178 @@ class TestUiStateLedgerSettings(unittest.TestCase):
                 mode="study", locked=True, runtime_dir=d)
             self.assertEqual(updated, {"mode": "study", "locked": True})
             self.assertEqual(telegram.settings_get(d), updated)
+
+
+    def test_confirm_cap_replaces_oldest(self):
+        with tempfile.TemporaryDirectory() as d:
+            ids = []
+            for i in range(3):
+                entry = telegram.ui_put(
+                    "confirm", {"n": i}, 111111111,
+                    runtime_dir=d, now=1000.0 + i,
+                    source_key=self._typed_source(d))
+                ids.append(entry["id"])
+            fourth = telegram.ui_put(
+                "confirm", {"n": 3}, 111111111,
+                runtime_dir=d, now=1003.0,
+                source_key=self._typed_source(d))
+            self.assertEqual(fourth.get("replaced"), [ids[0]])
+            self.assertIsNone(telegram.ui_get(
+                ids[0], runtime_dir=d, now=1004.0))
+            self.assertIsNotNone(telegram.ui_get(
+                ids[1], runtime_dir=d, now=1004.0))
+
+    def test_daily_confirm_cap_survives_gc(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_cap = telegram.DAILY_CONFIRM_CAP
+            telegram.DAILY_CONFIRM_CAP = 2
+            base = 1795608000.0
+            try:
+                source = self._typed_source(d)
+                telegram.ui_put(
+                    "confirm", {"n": 0}, 111111111,
+                    ttl_secs=10, runtime_dir=d, now=base,
+                    source_key=source)
+                telegram.ui_put(
+                    "confirm", {"n": 1}, 111111111,
+                    ttl_secs=10, runtime_dir=d, now=base + 3600,
+                    source_key=source)
+                with self.assertRaises(ValueError):
+                    telegram.ui_put(
+                        "confirm", {"n": 2}, 111111111,
+                        ttl_secs=10, runtime_dir=d,
+                        now=base + 7200, source_key=source)
+            finally:
+                telegram.DAILY_CONFIRM_CAP = old_cap
+
+    def test_daily_quiz_cap_survives_gc(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_cap = telegram.DAILY_QUIZ_CAP
+            telegram.DAILY_QUIZ_CAP = 2
+            base = 1795608000.0
+            try:
+                telegram.ui_put(
+                    "quiz", {"n": 0}, 111111111, 7,
+                    ttl_secs=10, runtime_dir=d, now=base)
+                telegram.ui_put(
+                    "quiz", {"n": 1}, 111111111, 8,
+                    ttl_secs=10, runtime_dir=d, now=base + 3600)
+                with self.assertRaises(ValueError):
+                    telegram.ui_put(
+                        "quiz", {"n": 2}, 111111111, 9,
+                        ttl_secs=10, runtime_dir=d,
+                        now=base + 7200)
+            finally:
+                telegram.DAILY_QUIZ_CAP = old_cap
+
+    def test_daily_counts_survive_other_ui_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_confirm_cap = telegram.DAILY_CONFIRM_CAP
+            old_quiz_cap = telegram.DAILY_QUIZ_CAP
+            telegram.DAILY_CONFIRM_CAP = 1
+            telegram.DAILY_QUIZ_CAP = 1
+            base = 1795608000.0
+            try:
+                source = self._typed_source(d)
+                confirm = telegram.ui_put(
+                    "confirm", {"n": 0}, 111111111,
+                    ttl_secs=10, runtime_dir=d, now=base,
+                    source_key=source)
+                telegram.ui_bind(confirm["id"], 42,
+                                 runtime_dir=d, now=base + 1)
+                quiz = telegram.ui_put(
+                    "quiz", {"n": 0}, 111111111, 7,
+                    ttl_secs=10, runtime_dir=d, now=base)
+                telegram.ui_consume(
+                    quiz["id"], kind="quiz", chat_id=111111111,
+                    message_id=7,
+                    payload_hash=quiz["payload_hash"],
+                    runtime_dir=d, now=base + 1)
+                with self.assertRaises(ValueError):
+                    telegram.ui_put(
+                        "confirm", {"n": 1}, 111111111,
+                        ttl_secs=10, runtime_dir=d,
+                        now=base + 3600, source_key=source)
+                with self.assertRaises(ValueError):
+                    telegram.ui_put(
+                        "quiz", {"n": 1}, 111111111, 8,
+                        ttl_secs=10, runtime_dir=d,
+                        now=base + 3600)
+            finally:
+                telegram.DAILY_CONFIRM_CAP = old_confirm_cap
+                telegram.DAILY_QUIZ_CAP = old_quiz_cap
+
+    def test_daily_counts_malformed_values_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = 1795608000.0
+            key = telegram._daily_count_key("quiz", base)
+            state_path = os.path.join(d, "ui-state.json")
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({"entries": {}, "daily_counts": {
+                    key: "bad", "quiz:not-a-date": 99,
+                    "confirm:2026-11-25": True}}, f)
+            entry = telegram.ui_put(
+                "quiz", {"n": 0}, 111111111, 7,
+                runtime_dir=d, now=base)
+            self.assertIsNotNone(entry)
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            self.assertEqual(state["daily_counts"], {key: 1})
+
+    def test_confirm_requires_source_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                telegram.ui_put(
+                    "confirm", {"n": 0}, 111111111,
+                    runtime_dir=d, now=1000.0)
+            with self.assertRaises(ValueError):
+                telegram.ui_put(
+                    "confirm", {"n": 0}, 111111111,
+                    runtime_dir=d, now=1000.0, source_key="  ")
+
+    def test_source_turn_derived_from_inbox(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as fh:
+                json.dump({"chat_id": 111111111}, fh)
+            photo = {"update_id": 1, "message": {
+                "message_id": 10, "date": 1000,
+                "from": {"id": 111111111},
+                "chat": {"id": 111111111, "type": "private"},
+                "photo": [{"file_id": "f1"}]}}
+            typed = {"update_id": 2, "message": {
+                "message_id": 11, "date": 1001,
+                "from": {"id": 111111111},
+                "chat": {"id": 111111111, "type": "private"},
+                "text": "remind me"}}
+            with open(os.path.join(d, "inbox.jsonl"), "w") as fh:
+                fh.write(json.dumps(photo) + "\n")
+                fh.write(json.dumps(typed) + "\n")
+            with self.assertRaises(ValueError):
+                telegram.ui_put(
+                    "confirm", {"n": 1}, 111111111,
+                    runtime_dir=d, now=1002.0,
+                    source_key="111111111:10")
+            entry = telegram.ui_put(
+                "confirm", {"n": 2}, 111111111,
+                runtime_dir=d, now=1002.0,
+                source_key="111111111:11")
+            self.assertEqual(entry["source_turn_class"], "typed")
+            self.assertEqual(
+                entry["data"]["source_turn_class"], "typed")
+            with self.assertRaises(ValueError):
+                telegram.ui_put(
+                    "confirm", {"n": 3}, 111111111,
+                    runtime_dir=d, now=1003.0,
+                    source_key="111111111:99")
+
+    def test_sanitizer_expandable_and_code_language(self):
+        out = telegram.sanitize_html(
+            '<blockquote expandable>long</blockquote>'
+            '<pre><code class="language-python">x=1</code></pre>'
+            '<code class="evil">y</code>')
+        self.assertIn("<blockquote expandable>", out)
+        self.assertIn('class="language-python"', out)
+        self.assertNotIn("evil", out)
 
 
 class TestRedaction(unittest.TestCase):

@@ -277,6 +277,40 @@ MUTATIONS = [
      "    if False:  # strip_urls_flag\n"
      "        text = strip_urls(text)",
      "test_telegram.TestParseMode.test_send_strip_urls_flag"),
+    ("daily cap: counter increments persistently",
+     "bin/telegram.py",
+     "            daily_counts[daily_key] = daily_counts.get(daily_key, 0) + 1",
+     "            pass  # daily counter increment removed",
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_daily_confirm_cap_survives_gc"),
+    ("daily cap: counters survive other UI writes",
+     "bin/telegram.py",
+     '        path, {"entries": entries, "daily_counts": daily_counts})',
+     '        path, {"entries": entries, "daily_counts": {}})',
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_daily_counts_survive_other_ui_writes"),
+    ("confirm: source_key is mandatory",
+     "bin/telegram.py",
+     "        if not isinstance(source_key, str) or not source_key.strip():\n"
+     "            raise ValueError(\n"
+     "                \"ui_put refused: confirm requires source_key\")\n"
+     "        derived_turn = _derive_source_turn_class(\n"
+     "            source_key, runtime_dir)\n"
+     "        if derived_turn in READONLY_TURN_CLASSES:\n"
+     "            raise ValueError(\n"
+     "                \"ui_put refused: read-only turn cannot create \"\n"
+     "                \"a confirmation\")\n"
+     "        if derived_turn is None:",
+     "        if source_key is not None:\n"
+     "            derived_turn = _derive_source_turn_class(\n"
+     "                source_key, runtime_dir)\n"
+     "        if derived_turn in READONLY_TURN_CLASSES:\n"
+     "            raise ValueError(\n"
+     "                \"ui_put refused: read-only turn cannot create \"\n"
+     "                \"a confirmation\")\n"
+     "        if source_key is not None and derived_turn is None:",
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_confirm_requires_source_key"),
 ]
 
 
