@@ -220,6 +220,8 @@ class TestSendText(unittest.TestCase):
         params = m.call_args[0][1]
         self.assertEqual(params["reply_to_message_id"], 9)
         self.assertTrue(params["allow_sending_without_reply"])
+        self.assertEqual(params["link_preview_options"],
+                         {"is_disabled": True})
 
     def test_long_splits_and_replies_once(self):
         text = "word " * 2000
@@ -285,6 +287,601 @@ class TestEditText(unittest.TestCase):
         with mock.patch.object(telegram, "call", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError):
                 telegram.edit_text("1", 5, "new")
+
+
+def _parse_error():
+    body = json.dumps({"ok": False, "error_code": 400,
+                       "description": "Bad Request: can't parse "
+                       "entities: unsupported start tag"}).encode()
+    err = urllib.error.HTTPError("http://x", 400, "Bad Request", {}, None)
+    err.read = lambda: body
+    return err
+
+
+class TestParseMode(unittest.TestCase):
+    def test_send_html_success(self):
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text("111111111", "<b>hi</b>",
+                               parse_mode="HTML")
+        params = m.call_args[0][1]
+        self.assertEqual(params["parse_mode"], "HTML")
+        self.assertEqual(params["text"], "<b>hi</b>")
+
+    def test_send_long_html_falls_back_to_plain_chunks(self):
+        text = "<b>" + ("word " * 2000) + "</b>"
+        self.assertGreater(len(text), 4096)
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text("111111111", text, parse_mode="HTML")
+        self.assertGreater(m.call_count, 1)
+        for call_args in m.call_args_list:
+            params = call_args[0][1]
+            self.assertNotIn("parse_mode", params)
+            self.assertNotIn("<b>", params["text"])
+            self.assertLessEqual(len(params["text"]), 4096)
+
+    def test_send_html_parse_failure_retries_plain(self):
+        with mock.patch.object(
+                telegram, "call",
+                side_effect=[_parse_error(), {"ok": True}]) as m:
+            telegram.send_text("111111111", "<b>hi &amp; bye</b>",
+                               parse_mode="HTML")
+        self.assertEqual(m.call_count, 2)
+        first = m.call_args_list[0][0][1]
+        second = m.call_args_list[1][0][1]
+        self.assertEqual(first["parse_mode"], "HTML")
+        self.assertNotIn("parse_mode", second)
+        self.assertEqual(second["text"], "hi & bye")
+
+    def test_sanitize_html_allowlist_and_links(self):
+        dirty = ('<script>alert(1)</script><b onclick="x">hi</b> '
+                 '<a href="javascript:alert(1)">bad</a> '
+                 '<a href="http://example.com">http</a> '
+                 '<a href="https://example.com">ok</a> &lt;tag&gt;')
+        clean = telegram.sanitize_html(dirty)
+        self.assertNotIn("<script", clean)
+        self.assertNotIn("onclick", clean)
+        self.assertNotIn("javascript:", clean)
+        self.assertNotIn("http://example.com", clean)
+        self.assertNotIn("https://example.com", clean)
+        self.assertNotIn("<a", clean)
+        self.assertIn("bad http ok", clean)
+        self.assertIn("<b>hi</b>", clean)
+        self.assertIn("&lt;tag&gt;", clean)
+
+    def test_strip_urls_removes_bare_links(self):
+        text = ("see https://example.com/path?q=1 and "
+                "www.example.org/x plus t.me/somechannel "
+                "and http://a.b/c, file telegram.py stays")
+        clean = telegram.strip_urls(text)
+        self.assertNotIn("example.com", clean)
+        self.assertNotIn("example.org", clean)
+        self.assertNotIn("t.me", clean)
+        self.assertNotIn("http", clean)
+        self.assertIn("telegram.py stays", clean)
+        self.assertEqual(clean.count("[link removed]"), 4)
+
+    def test_send_strip_urls_flag(self):
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text(
+                "111111111", "summary https://example.com/x end",
+                strip_urls_flag=True)
+        sent = m.call_args[0][1]["text"]
+        self.assertNotIn("example.com", sent)
+        self.assertIn("[link removed]", sent)
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text(
+                "111111111",
+                '<b>note</b> <a href="https://example.com">'
+                "https://example.com</a>",
+                parse_mode="HTML", strip_urls_flag=True)
+        sent = m.call_args[0][1]["text"]
+        self.assertNotIn("example.com", sent)
+        self.assertNotIn("<a", sent)
+
+    def test_send_html_visible_length_ignores_markup(self):
+        text = "<b>" + ("x" * 4000) + "</b><!--" + ("y" * 500) + "-->"
+        self.assertGreater(len(text), 4096)
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text("111111111", text, parse_mode="HTML")
+        self.assertEqual(m.call_count, 1)
+        params = m.call_args[0][1]
+        self.assertEqual(params["parse_mode"], "HTML")
+        self.assertNotIn("<!--", params["text"])
+
+    def test_send_html_non_parse_400_does_not_retry(self):
+        body = json.dumps({"ok": False, "error_code": 400,
+                           "description": "Bad Request: message text "
+                           "is empty"}).encode()
+        err = urllib.error.HTTPError("http://x", 400, "Bad Request", {}, None)
+        err.read = lambda: body
+        with mock.patch.object(telegram, "call", side_effect=err) as m:
+            with self.assertRaises(urllib.error.HTTPError):
+                telegram.send_text("111111111", "<b>hi</b>",
+                                   parse_mode="HTML")
+        self.assertEqual(m.call_count, 1)
+
+    def test_send_protect_content(self):
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.send_text("111111111", "private summary",
+                               protect_content=True)
+        self.assertTrue(m.call_args[0][1]["protect_content"])
+
+    def test_edit_html_success(self):
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            telegram.edit_text("111111111", 5, "<b>new</b>",
+                               parse_mode="HTML")
+        params = m.call_args[0][1]
+        self.assertEqual(params["parse_mode"], "HTML")
+        self.assertEqual(params["link_preview_options"],
+                         {"is_disabled": True})
+
+    def test_edit_overlong_refused_before_network(self):
+        with mock.patch.object(telegram, "call",
+                               return_value={"ok": True}) as m:
+            with self.assertRaises(ValueError):
+                telegram.edit_text("111111111", 5, "x" * 4097)
+        m.assert_not_called()
+
+    def test_edit_parse_failure_retries_plain(self):
+        with mock.patch.object(
+                telegram, "call",
+                side_effect=[_parse_error(), {"ok": True}]) as m:
+            telegram.edit_text("111111111", 5, "<b>new</b>",
+                               parse_mode="HTML")
+        self.assertEqual(m.call_count, 2)
+        second = m.call_args_list[1][0][1]
+        self.assertNotIn("parse_mode", second)
+        self.assertEqual(second["text"], "new")
+        self.assertEqual(second["link_preview_options"],
+                         {"is_disabled": True})
+
+    def test_photo_caption_parse_failure_retries_plain(self):
+        with mock.patch.object(
+                telegram, "call_multipart",
+                side_effect=[_parse_error(), {"ok": True}]) as m:
+            result = telegram.send_photo(
+                "111111111", "pic.png", caption="<b>cap</b>",
+                parse_mode="HTML")
+        self.assertTrue(result["ok"])
+        first_fields = m.call_args_list[0][0][1]
+        second_fields = m.call_args_list[1][0][1]
+        self.assertEqual(first_fields["parse_mode"], "HTML")
+        self.assertNotIn("parse_mode", second_fields)
+        self.assertEqual(second_fields["caption"], "cap")
+
+
+class TestMenusAndCommands(unittest.TestCase):
+    def test_menus_exist_and_callbacks_short(self):
+        self.assertTrue({"main", "study", "app", "admin"} <= set(
+            telegram.MENUS))
+        for menu in telegram.MENUS.values():
+            for row in menu["inline_keyboard"]:
+                for button in row:
+                    self.assertTrue(button["text"])
+                    data = button["callback_data"]
+                    self.assertTrue(data.startswith("cmd:"))
+                    self.assertLessEqual(len(data.encode("utf-8")), 64)
+
+    def test_bot_commands_valid(self):
+        import re
+        names = [c["command"] for c in telegram.BOT_COMMANDS]
+        self.assertEqual(len(names), len(set(names)))
+        for command in telegram.BOT_COMMANDS:
+            self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
+            self.assertTrue(command["description"])
+            self.assertLessEqual(len(command["description"]), 256)
+        self.assertIn("status", names)
+        self.assertIn("chats", names)
+        for deferred in ("sendto", "askchat", "restartbridge",
+                         "forget", "feed", "ideas", "doc", "image"):
+            self.assertNotIn(deferred, names)
+
+    def test_set_commands_payload_scoped_to_owner(self):
+        with mock.patch.dict(os.environ,
+                             {"BRIDGE_CHAT_ID": "111111111"}), \
+                mock.patch.object(telegram, "call",
+                                  return_value={"ok": True}) as m:
+            result = telegram.set_commands()
+        self.assertTrue(result["ok"])
+        method, params = m.call_args[0][0], m.call_args[0][1]
+        self.assertEqual(method, "setMyCommands")
+        self.assertEqual(params["commands"], telegram.BOT_COMMANDS)
+        self.assertEqual(params["scope"],
+                         {"type": "chat", "chat_id": 111111111})
+
+    def test_cli_set_commands(self):
+        with mock.patch.dict(os.environ,
+                             {"BRIDGE_CHAT_ID": "111111111"}), \
+                mock.patch.object(telegram, "call",
+                                  return_value={"ok": True,
+                                                "result": True}):
+            self.assertEqual(telegram.main(["set_commands"]), 0)
+
+
+class TestSendDocument(TelegramTestCase):
+    def _mock_upload(self):
+        body = json.dumps(
+            {"ok": True, "result": {"message_id": 6}}).encode()
+        response = mock.MagicMock()
+        response.read.side_effect = [body, b""]
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+        return mock.patch.object(urllib.request, "build_opener",
+                                 return_value=opener)
+
+    def test_document_inside_allowed_dir_ok(self):
+        path = os.path.join(self.send_dir, "report.txt")
+        with open(path, "w") as f:
+            f.write("report body")
+        with self._mock_upload():
+            result = telegram.send_document("111111111", path,
+                                            caption="report")
+        self.assertTrue(result["ok"])
+
+    def test_document_deleted_after_successful_send(self):
+        path = os.path.join(self.send_dir, "report.txt")
+        with open(path, "w") as f:
+            f.write("report body")
+        with self._mock_upload():
+            result = telegram.send_document("111111111", path)
+        self.assertTrue(result["ok"])
+        self.assertFalse(os.path.exists(path))
+
+    def test_document_symlink_refused(self):
+        target = os.path.join(self.send_dir, "target.txt")
+        with open(target, "w") as f:
+            f.write("target")
+        link = os.path.join(self.send_dir, "link.txt")
+        os.symlink(target, link)
+        with self.assertRaises(ValueError):
+            telegram.send_document("111111111", link)
+        self.assertTrue(os.path.exists(target))
+
+    def test_document_outside_allowed_dir_refused(self):
+        outside = os.path.join(self.tmp.name, "outside.txt")
+        with open(outside, "w") as f:
+            f.write("outside")
+        with self.assertRaises(ValueError):
+            telegram.send_document("111111111", outside)
+
+    def test_document_oversize_refused(self):
+        path = os.path.join(self.send_dir, "big.bin")
+        with open(path, "wb") as f:
+            f.truncate(telegram.MAX_DOCUMENT_BYTES + 1)
+        with self.assertRaises(ValueError):
+            telegram.send_document("111111111", path)
+
+    def test_cli_send_document_arbitrary_chat_refused(self):
+        with mock.patch.dict(os.environ,
+                             {"BRIDGE_CHAT_ID": "111111111"}), \
+                mock.patch.object(telegram, "send_document",
+                                  return_value={"ok": True}) as m:
+            code = telegram.main(
+                ["send_document", "999999999", "report.txt"])
+        self.assertEqual(code, 1)
+        m.assert_not_called()
+
+
+class TestBridgeStatus(unittest.TestCase):
+    def _runtime(self, d):
+        with open(os.path.join(d, "poller-state.json"), "w") as f:
+            json.dump({"beat_at": 1000.0, "cycles": 7,
+                       "errors": 2, "pid": 4242}, f)
+        with open(os.path.join(d, "state.json"), "w") as f:
+            json.dump({"offset": 123}, f)
+        with open(os.path.join(d, "seen.json"), "w") as f:
+            json.dump({"last_update_id": 120}, f)
+        with open(os.path.join(d, "pending.json"), "w") as f:
+            json.dump({"entries": {
+                "1": {"payload": {"chat_id": 111111111,
+                                  "text": "SECRET TEXT"}},
+                "2": {"dropped": True,
+                      "payload": {"chat_id": 111111111,
+                                  "text": "DROP SECRET"}}}}, f)
+        with open(os.path.join(d, "handled.txt"), "w") as f:
+            f.write("111111111:10\n111111111:11\n")
+        with open(os.path.join(d, "scan-failures.count"), "w") as f:
+            f.write("3\n")
+        with open(os.path.join(d, "inbox.jsonl"), "w") as f:
+            f.write('{"text":"SECRET TEXT"}\n')
+
+    def test_bridge_status_counts_and_redaction(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._runtime(d)
+            status = telegram.bridge_status(d, now=1005.0)
+        self.assertEqual(status["heartbeat_age_secs"], 5)
+        self.assertTrue(status["poller_alive"])
+        self.assertEqual(status["cycles"], 7)
+        self.assertEqual(status["errors"], 2)
+        self.assertNotIn("offset", status)
+        self.assertNotIn("seen_last_update_id", status)
+        self.assertEqual(status["pending_count"], 2)
+        self.assertEqual(status["dropped_count"], 1)
+        self.assertEqual(status["handled_count"], 2)
+        self.assertEqual(status["scan_failure_count"], 3)
+        self.assertGreater(status["inbox_bytes"], 0)
+        rendered = json.dumps(status)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("111111111", rendered)
+        self.assertNotIn("TESTTOKEN", rendered)
+
+    def test_cli_bridge_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._runtime(d)
+            with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+                code = telegram.main(
+                    ["bridge_status", "--runtime-dir", d])
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["pending_count"], 2)
+        self.assertNotIn("SECRET", out.getvalue())
+
+
+class TestUiStateLedgerSettings(unittest.TestCase):
+    def test_ui_consume_once_and_replay_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            entry = telegram.ui_put(
+                "quiz", {"action": "reveal", "text": "hello"},
+                111111111, 42, runtime_dir=d, now=1000.0)
+            self.assertEqual(len(entry["id"]), 32)
+            # Omitting the binding never validates.
+            self.assertIsNone(telegram.ui_consume(
+                entry["id"], kind="quiz",
+                payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1001.0))
+            self.assertIsNone(telegram.ui_consume(
+                entry["id"], kind="quiz", chat_id=111111111,
+                payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1001.0))
+            consumed = telegram.ui_consume(
+                entry["id"], kind="quiz", chat_id=111111111,
+                message_id=42, payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1001.0)
+            self.assertIsNotNone(consumed)
+            self.assertTrue(consumed["consumed"])
+            replay = telegram.ui_consume(
+                entry["id"], kind="quiz", chat_id=111111111,
+                message_id=42, payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1002.0)
+            self.assertIsNone(replay)
+
+    def test_ui_expiry_and_binding_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            entry = telegram.ui_put(
+                "quiz", {"answer": "x"}, 111111111, 7,
+                ttl_secs=10, runtime_dir=d, now=1000.0)
+            self.assertIsNone(telegram.ui_consume(
+                entry["id"], kind="quiz", chat_id=999999999,
+                message_id=7, payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1001.0))
+            self.assertIsNone(telegram.ui_consume(
+                entry["id"], kind="quiz", chat_id=111111111,
+                message_id=7, payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1011.0))
+
+    def test_action_ledger_duplicate_prevention(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "done", "task": "fake-task"}
+            self.assertTrue(telegram.action_reserve(
+                "entry-1", payload, runtime_dir=d, now=1000.0))
+            self.assertFalse(telegram.action_reserve(
+                "entry-1", payload, runtime_dir=d, now=1001.0))
+            # A generic reserve is not a confirm_begin action:
+            # commit must fail, and commit without any reserve
+            # fails too.
+            self.assertFalse(telegram.action_commit(
+                "entry-1", payload=payload, runtime_dir=d,
+                now=1002.0))
+            self.assertFalse(telegram.action_commit(
+                "confirm:missing", payload=payload, runtime_dir=d,
+                now=1003.0))
+
+    def test_confirm_begin_replay_hash_and_commit_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "done", "task_id": "fake-1",
+                       "source_turn_class": "typed"}
+            entry = telegram.ui_put(
+                "confirm", payload, 111111111,
+                runtime_dir=d, now=1000.0)
+            telegram.ui_bind(entry["id"], 42, runtime_dir=d,
+                             now=1000.5)
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=42,
+                payload_hash="wrong", runtime_dir=d, now=1001.0,
+                turn_class="callback"))
+            begun = telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=42,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1002.0, turn_class="callback")
+            self.assertTrue(begun["begun"])
+            self.assertEqual(begun["payload"], payload)
+            self.assertEqual(begun["action_id"],
+                             "confirm:" + entry["id"])
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=42,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1003.0, turn_class="callback"))
+            self.assertTrue(telegram.action_commit(
+                begun["action_id"], payload=payload, runtime_dir=d,
+                now=1004.0, result="failed"))
+            self.assertFalse(telegram.action_commit(
+                begun["action_id"], payload=payload, runtime_dir=d,
+                now=1005.0, result="committed"))
+
+    def test_confirm_begin_reserve_without_commit_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "note", "text": "hello"}
+            entry = telegram.ui_put(
+                "confirm", payload, 111111111,
+                runtime_dir=d, now=1000.0)
+            telegram.ui_bind(entry["id"], 9, runtime_dir=d,
+                             now=1000.5)
+            self.assertTrue(telegram.action_reserve(
+                "confirm:" + entry["id"], payload, runtime_dir=d,
+                now=1001.0, turn_class="callback"))
+            begun = telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=9,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1002.0, turn_class="callback")
+            self.assertFalse(begun["begun"])
+            self.assertTrue(begun["unknown"])
+            self.assertEqual(begun["state"], "reserved")
+
+    def test_media_turn_cannot_reserve_or_confirm(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "note", "text": "hello",
+                       "source_turn_class": "media_readonly"}
+            with self.assertRaises(ValueError):
+                telegram.action_reserve(
+                    "entry-media", payload, runtime_dir=d,
+                    now=1000.0, turn_class="media_readonly")
+            entry = telegram.ui_put(
+                "confirm", payload, 111111111,
+                runtime_dir=d, now=1000.0)
+            telegram.ui_bind(entry["id"], 3, runtime_dir=d,
+                             now=1000.5)
+            begun = telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=3,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1001.0, turn_class="callback")
+            self.assertFalse(begun["begun"])
+            self.assertEqual(begun["reason"], "media_readonly")
+
+    def test_confirm_full_flow_differing_message_ids(self):
+        # Real flow: the owner's source message is 100, the
+        # preview carrying the buttons is sent afterwards and
+        # gets id 200, and the callback names 200. The entry
+        # must bind to 200, never to the source message.
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "note", "text": "hello",
+                       "source_turn_class": "typed"}
+            with self.assertRaises(ValueError):
+                telegram.ui_put("confirm", payload, 111111111, 100,
+                                runtime_dir=d, now=1000.0)
+            entry = telegram.ui_put(
+                "confirm", payload, 111111111,
+                runtime_dir=d, now=1000.0)
+            self.assertFalse(entry["bound"])
+            # Unbound: no confirm validates yet, with or
+            # without a message id.
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=200,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1001.0, turn_class="callback"))
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1001.0, turn_class="callback"))
+            bound = telegram.ui_bind(entry["id"], 200,
+                                     chat_id=111111111,
+                                     runtime_dir=d, now=1002.0)
+            self.assertTrue(bound["bound"])
+            self.assertEqual(bound["message_id"], 200)
+            # The source message id does not confirm, and
+            # omitting either id does not bypass the binding.
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=100,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1003.0, turn_class="callback"))
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1003.0, turn_class="callback"))
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], message_id=200,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1003.0, turn_class="callback"))
+            begun = telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=200,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1004.0, turn_class="callback")
+            self.assertTrue(begun["begun"])
+            self.assertEqual(begun["message_id"], 200)
+            self.assertEqual(begun["payload"], payload)
+
+    def test_ui_bind_one_way_and_guards(self):
+        with tempfile.TemporaryDirectory() as d:
+            entry = telegram.ui_put(
+                "confirm", {"action": "note"}, 111111111,
+                runtime_dir=d, now=1000.0)
+            self.assertIsNone(telegram.ui_bind(
+                "missing", 200, runtime_dir=d, now=1001.0))
+            self.assertIsNone(telegram.ui_bind(
+                entry["id"], 200, chat_id=999999999,
+                runtime_dir=d, now=1001.0))
+            bound = telegram.ui_bind(entry["id"], 200,
+                                     runtime_dir=d, now=1001.0)
+            self.assertEqual(bound["message_id"], 200)
+            # Same id again is a no-op; a different id never
+            # moves the binding.
+            again = telegram.ui_bind(entry["id"], 200,
+                                     runtime_dir=d, now=1002.0)
+            self.assertEqual(again["message_id"], 200)
+            self.assertIsNone(telegram.ui_bind(
+                entry["id"], 300, runtime_dir=d, now=1002.0))
+            kept = telegram.ui_get(entry["id"], runtime_dir=d,
+                                   now=1003.0)
+            self.assertEqual(kept["message_id"], 200)
+
+    def test_confirm_rejects_entry_with_bound_flag_cleared(self):
+        # A stored message id alone is not a binding: an entry
+        # whose bound flag is false never confirms, even when
+        # the callback names that stored id.
+        with tempfile.TemporaryDirectory() as d:
+            entry = telegram.ui_put(
+                "confirm", {"action": "note"}, 111111111,
+                runtime_dir=d, now=1000.0)
+            telegram.ui_bind(entry["id"], 200, runtime_dir=d,
+                             now=1000.5)
+            state_path = os.path.join(d, "ui-state.json")
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            state["entries"][entry["id"]]["bound"] = False
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            self.assertIsNone(telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=200,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1001.0, turn_class="callback"))
+
+    def test_ui_consume_refuses_confirm_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            payload = {"action": "note", "text": "hello"}
+            entry = telegram.ui_put(
+                "confirm", payload, 111111111,
+                runtime_dir=d, now=1000.0)
+            telegram.ui_bind(entry["id"], 55, runtime_dir=d,
+                             now=1000.5)
+            # A confirm entry never consumes through ui_consume,
+            # and the refusal leaves it live for confirm_begin.
+            self.assertIsNone(telegram.ui_consume(
+                entry["id"], kind="confirm", chat_id=111111111,
+                message_id=55, payload_hash=entry["payload_hash"],
+                runtime_dir=d, now=1001.0))
+            begun = telegram.confirm_begin(
+                entry["id"], chat_id=111111111, message_id=55,
+                payload_hash=entry["payload_hash"], runtime_dir=d,
+                now=1002.0, turn_class="callback")
+            self.assertTrue(begun["begun"])
+
+    def test_settings_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(telegram.settings_get(d),
+                             {"mode": "short", "locked": False})
+            updated = telegram.settings_set(
+                mode="study", locked=True, runtime_dir=d)
+            self.assertEqual(updated, {"mode": "study", "locked": True})
+            self.assertEqual(telegram.settings_get(d), updated)
 
 
 class TestRedaction(unittest.TestCase):

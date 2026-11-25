@@ -176,6 +176,8 @@ tests/                     Unit and integration tests (python3 tests/run_tests.p
 ## Limitations
 
 - The update-id epoch-reset path is defensive and unconfirmed against real Telegram behaviour. The bridge keeps recent update ids and an epoch boundary so a fresh lower-id update can be delivered once if Telegram ever reuses ids after a long silence, and the poller drops a stale stored offset once after more than seven days without updates so such an epoch could be seen. With a high stored offset, `getUpdates` might otherwise never return the lower-id epoch; if Telegram does not reuse ids, or the updates have expired, the path simply never activates.
+- Confirmation rate caps are not implemented yet: the helper enforces no limit on how many confirmations may be open at once or created per day. Each confirmation is still single-use, bound to its preview message, and expires by TTL, but a new preview is never rejected for exceeding a cap.
+- Read-only turn classification is cooperative: the helper rejects writes for media/data read-only turns based on the `turn_class` the worker passes and the `source_turn_class` stored in the confirmation payload; it does not independently derive the turn class from the inbox. The worker prompt is responsible for classifying turns correctly.
 
 ## License
 

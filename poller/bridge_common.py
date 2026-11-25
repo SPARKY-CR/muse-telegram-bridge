@@ -65,6 +65,79 @@ UNSUPPORTED_KEYS = (
     "invoice", "successful_payment", "passport_data",
 )
 
+# Deterministic command gate table (v9). The scan parses typed
+# slash commands against this table plus settings, so unknown
+# and locked-blocked commands never reach tool use.
+READ_ONLY_COMMANDS = {
+    "start", "menu", "help", "status", "health", "today",
+    "schedule", "study", "goals", "goal", "chats", "chat",
+    "search", "tasks", "reminders", "privacy",
+}
+CONFIRM_COMMANDS = {
+    "remind", "note", "progress", "done", "cancelreminder",
+}
+EPHEMERAL_COMMANDS = {"quiz"}
+SETTINGS_COMMANDS = {"lock", "mode", "unlock"}
+KNOWN_COMMANDS = (READ_ONLY_COMMANDS | CONFIRM_COMMANDS
+                  | EPHEMERAL_COMMANDS | SETTINGS_COMMANDS)
+
+
+def _gate_class(command):
+    if command in READ_ONLY_COMMANDS:
+        return "read_only"
+    if command in CONFIRM_COMMANDS:
+        return "confirm"
+    if command in EPHEMERAL_COMMANDS:
+        return "ephemeral"
+    if command in SETTINGS_COMMANDS:
+        return "settings"
+    return "unknown"
+
+
+def parse_typed_command(text, locked=False):
+    """Parse a typed slash command against the gate table.
+
+    Returns (parsed_command, args, command_class, gate_class).
+    Only call this for typed_text payloads; captions, forwards,
+    transcripts, and documents are data and never reach here.
+    Locked mode is a write-pause: read-only commands and typed
+    /unlock still run, writes/settings/quiz are blocked."""
+    if not isinstance(text, str) or not text.startswith("/"):
+        return None, "", "message", "message"
+    parts = text[1:].split(None, 1)
+    raw = parts[0] if parts else ""
+    args = parts[1].strip() if len(parts) > 1 else ""
+    command = raw.split("@", 1)[0].lower()
+    if not command or not re.fullmatch(r"[a-z0-9_]+", command):
+        return command, args, "command_unknown", "unknown"
+    if command not in KNOWN_COMMANDS:
+        return command, args, "command_unknown", "unknown"
+    gate = _gate_class(command)
+    if locked and gate != "read_only" and command != "unlock":
+        return command, args, "command_blocked", "blocked"
+    return command, args, "command", gate
+
+
+def apply_command_gate(payload, locked=False):
+    """Stamp parsed_command/args/command_class on a typed-text
+    payload in place. Non-command payloads are left untouched."""
+    if not isinstance(payload, dict):
+        return payload
+    if payload.get("origin") != "typed_text" \
+            or payload.get("kind") != "message":
+        return payload
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.startswith("/"):
+        payload["command_class"] = "message"
+        return payload
+    command, args, command_class, gate = parse_typed_command(
+        text, locked=locked)
+    payload["parsed_command"] = command
+    payload["args"] = args
+    payload["command_class"] = command_class
+    payload["gate_class"] = gate
+    return payload
+
 
 def _dict(value):
     """Return value when it is a dict, else an empty dict. Every
@@ -148,6 +221,8 @@ def classify(update, owner_id, allow_groups=False):
             "message_id": cb_msg.get("message_id", 0),
             "date": cb_msg.get("date", 0),
             "chat_id": chat_id, "chat_type": chat_type,
+            "origin": "callback", "command_class": "callback",
+            "turn_class": "callback",
         }
 
     msg = update.get("message")
@@ -165,42 +240,66 @@ def classify(update, owner_id, allow_groups=False):
     date = msg.get("date", 0)
     base = {"update_id": uid, "message_id": message_id, "date": date,
             "chat_id": chat_id, "chat_type": chat_type}
+    forwarded = any(key in msg for key in (
+        "forward_origin", "forward_from", "forward_from_chat",
+        "forward_sender_name", "forward_date", "forward_signature"))
 
     text = msg.get("text")
     if isinstance(text, str) and text:
-        return "message", dict(base, kind="message", text=text)
+        if forwarded:
+            return "message", dict(
+                base, kind="message", text=text, origin="forwarded",
+                command_class="data", turn_class="data_readonly")
+        payload = dict(base, kind="message", text=text,
+                       origin="typed_text", command_class="message",
+                       turn_class="typed")
+        # The poller stamps origin at claim time; the scan
+        # re-applies the gate with live settings (locked mode).
+        return "message", apply_command_gate(payload)
     photo = msg.get("photo")
     if isinstance(photo, list) and photo:
         sizes = [p for p in photo if isinstance(p, dict)]
         if sizes:
             largest = sizes[-1]
             caption = msg.get("caption", "")
+            caption = caption if isinstance(caption, str) else ""
             return "photo", dict(
                 base, kind="photo",
                 file_id=largest.get("file_id", ""),
-                caption=caption if isinstance(caption, str) else "")
+                caption=caption,
+                origin="caption" if caption else "document_content",
+                command_class="data", turn_class="media_readonly")
     document = _dict(msg.get("document"))
     if document:
         caption = msg.get("caption", "")
+        caption = caption if isinstance(caption, str) else ""
         return "document", dict(
             base, kind="document",
             file_id=document.get("file_id", ""),
             file_name=document.get("file_name", ""),
             mime_type=document.get("mime_type", ""),
             file_size=document.get("file_size", 0),
-            caption=caption if isinstance(caption, str) else "")
+            caption=caption,
+            origin="caption" if caption else "document_content",
+            command_class="data", turn_class="media_readonly")
     voice = _dict(msg.get("voice"))
     if voice:
         return "voice", dict(
             base, kind="voice",
             file_id=voice.get("file_id", ""),
-            duration=voice.get("duration", 0))
+            duration=voice.get("duration", 0),
+            origin="voice", command_class="data",
+            turn_class="media_readonly")
     for key in UNSUPPORTED_KEYS:
         if key in msg:
             return "unsupported", dict(
-                base, kind="unsupported", unsupported_type=key)
+                base, kind="unsupported", unsupported_type=key,
+                origin="document_content", command_class="data",
+                turn_class="media_readonly")
     return "unsupported", dict(
-        base, kind="unsupported", unsupported_type="unknown")
+        base, kind="unsupported", unsupported_type="unknown",
+        origin="document_content", command_class="data",
+        turn_class="media_readonly")
 
 
 def parse_offset(value):

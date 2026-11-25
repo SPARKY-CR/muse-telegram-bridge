@@ -123,6 +123,40 @@ class TestBasicScan(ScanTestCase):
         self.assertEqual(len(payload["new_messages"]), 1)
         self.assertEqual(payload["new_messages"][0]["kind"], "callback")
 
+    def test_pre_router_unknown_and_locked(self):
+        self._append(_msg(1, text="/bogus hi"))
+        payload = self._scan()
+        msg = payload["new_messages"][0]
+        self.assertEqual(msg["command_class"], "command_unknown")
+        self.assertEqual(msg["parsed_command"], "bogus")
+        self.assertEqual(msg["args"], "hi")
+
+    def test_pre_router_locked_blocks_write_not_read(self):
+        with open(os.path.join(self.tmp.name, "settings.json"),
+                  "w") as f:
+            json.dump({"mode": "short", "locked": True}, f)
+        self._append(_msg(1, text="/remind water 9am"),
+                     _msg(2, text="/status"))
+        payload = self._scan()
+        by_id = {m["update_id"]: m
+                 for m in payload["new_messages"]}
+        self.assertEqual(by_id[1]["command_class"],
+                         "command_blocked")
+        self.assertEqual(by_id[2]["command_class"], "command")
+        self.assertEqual(by_id[2]["parsed_command"], "status")
+
+    def test_caption_slash_stays_data_in_scan(self):
+        upd = _msg(1, text=None)
+        upd["message"].pop("text")
+        upd["message"]["photo"] = [{"file_id": "p1"}]
+        upd["message"]["caption"] = "/remind water 9am"
+        self._append(upd)
+        payload = self._scan()
+        msg = payload["new_messages"][0]
+        self.assertEqual(msg["command_class"], "data")
+        self.assertEqual(msg["turn_class"], "media_readonly")
+        self.assertNotIn("parsed_command", msg)
+
     def test_dry_run_writes_nothing(self):
         self._append(_msg(1))
         payload = self._scan(dry_run=True)

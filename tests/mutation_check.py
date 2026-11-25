@@ -239,6 +239,44 @@ MUTATIONS = [
      "return False",
      "test_poller_subprocess.TestPollerSubprocess."
      "test_offset_dropped_once_after_long_silence"),
+    ("confirm: bound message binding is mandatory",
+     "bin/telegram.py",
+     "        if not _ui_entry_valid(entry, kind, chat_id, message_id,\n"
+     "                               payload_hash, current,\n"
+     "                               require_bound=True) \\",
+     "        if not _ui_entry_valid(entry, kind, chat_id, message_id,\n"
+     "                               payload_hash, current,\n"
+     "                               require_bound=False) \\",
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_confirm_full_flow_differing_message_ids"),
+    ("confirm: bound flag gates a stored message id",
+     "bin/telegram.py",
+     "        if not _entry_bound(entry):\n"
+     "            return False",
+     "        if False:  # not _entry_bound(entry)\n"
+     "            return False",
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_confirm_rejects_entry_with_bound_flag_cleared"),
+    ("ui_bind: binding never moves to another message",
+     "bin/telegram.py",
+     "        if _entry_bound(entry):",
+     "        if False:  # _entry_bound(entry)",
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_ui_bind_one_way_and_guards"),
+    ("ui_consume: confirm entries refused",
+     "bin/telegram.py",
+     '        if isinstance(entry, dict) \\\n'
+     '                and entry.get("kind") == "confirm":',
+     '        if False:  # confirm entries refused',
+     "test_telegram.TestUiStateLedgerSettings."
+     "test_ui_consume_refuses_confirm_entries"),
+    ("send: strip-urls removes bare links",
+     "bin/telegram.py",
+     "    if strip_urls_flag:\n"
+     "        text = strip_urls(text)",
+     "    if False:  # strip_urls_flag\n"
+     "        text = strip_urls(text)",
+     "test_telegram.TestParseMode.test_send_strip_urls_flag"),
 ]
 
 

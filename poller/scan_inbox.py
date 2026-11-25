@@ -405,9 +405,23 @@ def _dropped_notice_due(entry, now, retry_after):
     return now - notified >= interval, interval
 
 
+def _settings_locked(pending_path, settings_path=None):
+    """Locked flag from settings.json (write-pause). Missing or
+    malformed settings fail open to unlocked, matching the
+    helper's settings_get defaults."""
+    path = settings_path or os.environ.get("TELEGRAM_SETTINGS_FILE")
+    if not path:
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(pending_path)),
+            "settings.json")
+    data = bridge_common.load_json_file(path) or {}
+    locked = data.get("locked")
+    return locked if isinstance(locked, bool) else False
+
+
 def scan(inbox_path, seen_path, pending_path, handled_path, chat_id,
          retry_after=DEFAULT_RETRY_AFTER, allow_groups=False,
-         dry_run=False, ack_path=None):
+         dry_run=False, ack_path=None, settings_path=None):
     """Run one scan. Returns (payload_dict, warnings). Writes the
     markers unless dry_run is set."""
     warnings = []
@@ -455,6 +469,7 @@ def scan(inbox_path, seen_path, pending_path, handled_path, chat_id,
         epoch_boundary_at = now
     pending = _sanitize_pending(
         load_pending(pending_path), warnings, retry_after)
+    locked = _settings_locked(pending_path, settings_path)
 
     # Confirm pending messages the agent has handled since the
     # last scan; drop them so they are never re-woken. A dropped
@@ -516,6 +531,11 @@ def scan(inbox_path, seen_path, pending_path, handled_path, chat_id,
         received = bridge_common.parse_timestamp(upd.get("received_at"))
         if received is not None:
             payload["received_at"] = received
+        # Deterministic pre-router: typed slash commands are
+        # parsed against the gate table and live settings, so
+        # unknown/locked-blocked commands carry a fixed-reply
+        # class and never reach tool use.
+        bridge_common.apply_command_gate(payload, locked=locked)
         if seen_missing and uid <= seen:
             # Recovering from a lost marker: deliver only fresh
             # updates, but still advance past the old ones. The
@@ -646,6 +666,7 @@ def scan(inbox_path, seen_path, pending_path, handled_path, chat_id,
         if len(new_messages) >= bridge_common.MAX_MESSAGES_PER_WAKE:
             continue
         redelivered = dict(payload)
+        bridge_common.apply_command_gate(redelivered, locked=locked)
         redelivered["redelivery"] = True
         redelivered["attempt"] = attempts + 1
         new_messages.append(redelivered)
@@ -693,6 +714,10 @@ def main(argv=None):
                         default=DEFAULT_RETRY_AFTER)
     parser.add_argument("--ack", default=None,
                         help="Ack file (default: <handled>.ack)")
+    parser.add_argument("--settings", default=None,
+                        help="Settings file for the command gate "
+                             "(default: settings.json next to "
+                             "the pending file)")
     parser.add_argument("--allow-groups", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -731,7 +756,7 @@ def main(argv=None):
             args.inbox, args.seen, args.pending, args.handled,
             args.chat_id, retry_after=args.retry_after,
             allow_groups=args.allow_groups, dry_run=args.dry_run,
-            ack_path=args.ack)
+            ack_path=args.ack, settings_path=args.settings)
     except Exception as exc:  # noqa: BLE001 - fail closed, stay silent
         print(f"scan failed: {exc}", file=sys.stderr)
         return 1

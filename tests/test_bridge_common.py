@@ -70,6 +70,83 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(payload["data"], "cmd:status")
         self.assertEqual(payload["callback_query_id"], "cb1")
 
+    def test_typed_slash_is_command(self):
+        kind, payload = bc.classify(_msg(30, text="/status"), OWNER)
+        self.assertEqual(kind, "message")
+        self.assertEqual(payload["origin"], "typed_text")
+        self.assertEqual(payload["command_class"], "command")
+        self.assertEqual(payload["parsed_command"], "status")
+        self.assertEqual(payload["args"], "")
+        self.assertEqual(payload["gate_class"], "read_only")
+        self.assertEqual(payload["turn_class"], "typed")
+
+    def test_unknown_and_locked_gate_classes(self):
+        kind, payload = bc.classify(
+            _msg(36, text="/bogus x"), OWNER)
+        self.assertEqual(payload["command_class"],
+                         "command_unknown")
+        self.assertEqual(payload["parsed_command"], "bogus")
+        self.assertEqual(payload["args"], "x")
+        command, args, cls, gate = bc.parse_typed_command(
+            "/remind water 9am", locked=True)
+        self.assertEqual((command, cls, gate),
+                         ("remind", "command_blocked", "blocked"))
+        command, args, cls, gate = bc.parse_typed_command(
+            "/status", locked=True)
+        self.assertEqual((command, cls, gate),
+                         ("status", "command", "read_only"))
+        command, args, cls, gate = bc.parse_typed_command(
+            "/unlock", locked=True)
+        self.assertEqual(cls, "command")
+
+    def test_forwarded_slash_is_data(self):
+        upd = _msg(31, text="/status")
+        upd["message"]["forward_origin"] = {"type": "user"}
+        kind, payload = bc.classify(upd, OWNER)
+        self.assertEqual(kind, "message")
+        self.assertEqual(payload["origin"], "forwarded")
+        self.assertEqual(payload["command_class"], "data")
+
+    def test_caption_slash_is_data(self):
+        upd = _msg(32, text=None)
+        upd["message"].pop("text")
+        upd["message"]["photo"] = [{"file_id": "p1"}]
+        upd["message"]["caption"] = "/status"
+        kind, payload = bc.classify(upd, OWNER)
+        self.assertEqual(kind, "photo")
+        self.assertEqual(payload["origin"], "caption")
+        self.assertEqual(payload["command_class"], "data")
+        self.assertEqual(payload["turn_class"], "media_readonly")
+        self.assertNotIn("parsed_command", payload)
+
+    def test_voice_and_document_are_data(self):
+        upd = _msg(33, text=None)
+        upd["message"].pop("text")
+        upd["message"]["voice"] = {"file_id": "v9", "duration": 3}
+        kind, payload = bc.classify(upd, OWNER)
+        self.assertEqual(kind, "voice")
+        self.assertEqual(payload["origin"], "voice")
+        self.assertEqual(payload["command_class"], "data")
+        self.assertEqual(payload["turn_class"], "media_readonly")
+
+        upd = _msg(34, text=None)
+        upd["message"].pop("text")
+        upd["message"]["document"] = {"file_id": "d9"}
+        kind, payload = bc.classify(upd, OWNER)
+        self.assertEqual(kind, "document")
+        self.assertEqual(payload["origin"], "document_content")
+        self.assertEqual(payload["command_class"], "data")
+
+    def test_callback_origin(self):
+        upd = {"update_id": 35, "callback_query": {
+            "id": "cb35", "from": {"id": OWNER},
+            "message": {"message_id": 9, "date": 1},
+            "data": "cmd:status"}}
+        kind, payload = bc.classify(upd, OWNER)
+        self.assertEqual(kind, "callback")
+        self.assertEqual(payload["origin"], "callback")
+        self.assertEqual(payload["command_class"], "callback")
+
     def test_unsupported_sticker(self):
         upd = _msg(6, text=None)
         upd["message"].pop("text")
