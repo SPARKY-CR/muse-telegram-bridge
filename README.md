@@ -121,7 +121,7 @@ whisper-venv/bin/hf download Systran/faster-whisper-small \
   --local-dir models/whisper-small
 ```
 
-The worker prompt already points at these paths. Voice *replies* use a local Piper TTS install (private, offline): `telegram.py voice_reply <chat_id> - --lang fa|en` synthesizes Persian (`fa_IR-ganji-medium`) or English (`en_US-lessac-medium`) speech, converts it to OGG Opus with ffmpeg, and sends it as a voice note. Piper is found via `PIPER_PYTHON` (default `~/workspace/piper-venv/bin/python`) and `PIPER_VOICES_DIR` (default `~/workspace/models/piper`); `FFMPEG_BIN` overrides the ffmpeg binary. Voice replies are capped at 1000 characters and 10 MB; without Piper installed, replies fall back to text.
+The worker prompt already points at these paths. Voice *replies* use a local Piper TTS install (private, offline): `telegram.py voice_reply <chat_id> - --lang fa|en` synthesizes Persian (`fa_IR-magnoliasis-medium`) or English (`en_US-lessac-medium`) speech, converts it to OGG Opus with ffmpeg, and sends it as a voice note. Piper is found via `PIPER_PYTHON` (default `~/workspace/piper-venv/bin/python`) and `PIPER_VOICES_DIR` (default `~/workspace/models/piper`); `FFMPEG_BIN` overrides the ffmpeg binary. Voice replies are capped at 1000 characters and 10 MB; without Piper installed, replies fall back to text.
 
 ## Commands
 

@@ -139,7 +139,7 @@ MAX_VOICE_TEXT_CHARS = 1000  # voice replies stay short
 # ~/workspace/piper-venv/bin/python when present, else the current
 # interpreter; PIPER_VOICES_DIR defaults to ~/workspace/models/piper.
 PIPER_VOICES = {
-    "fa": "fa_IR-ganji-medium.onnx",
+    "fa": "fa_IR-magnoliasis-medium.onnx",
     "en": "en_US-lessac-medium.onnx",
 }
 

@@ -696,7 +696,7 @@ class TestVoiceReply(TelegramTestCase):
         self.assertEqual(file_field, "voice")
         self.assertEqual(fields["chat_id"], "111111111")
         piper_cmd, piper_input = calls[0]
-        self.assertIn("fa_IR-ganji-medium.onnx", piper_cmd[4])
+        self.assertIn("fa_IR-magnoliasis-medium.onnx", piper_cmd[4])
         self.assertEqual(piper_input, "سلام دنیا".encode("utf-8"))
         self.assertEqual(os.listdir(self.send_dir), [])
 
