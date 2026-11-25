@@ -254,11 +254,12 @@ export TELEGRAM_ACK_FILE="$HANDLED_FILE.ack"
 export TELEGRAM_DOWNLOAD_DIR="$WEBHOOK_DIR/downloads"
 export TELEGRAM_SEND_PATHS="$WEBHOOK_DIR/outbox"
 export TELEGRAM_POLLER_LOCK="$POLLER_LOCK"
+export TELEGRAM_SETTINGS_FILE="$WEBHOOK_DIR/settings.json"
 
 # --- Message detection: the Python scan owns the seen/pending
 # markers (atomic writes, fail-closed on corruption, retry for
 # unhandled messages). A dry run must not write any state. ---
-SCAN_ARGS=(--ack "$HANDLED_FILE.ack")
+SCAN_ARGS=(--ack "$HANDLED_FILE.ack" --settings "$WEBHOOK_DIR/settings.json")
 if [ "${HATCH_HOOK_DRY_RUN:-0}" = "1" ]; then
   SCAN_ARGS+=(--dry-run)
 fi
