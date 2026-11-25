@@ -362,6 +362,21 @@ class TestParseMode(unittest.TestCase):
         self.assertIn("telegram.py stays", clean)
         self.assertEqual(clean.count("[link removed]"), 4)
 
+    def test_strip_urls_removes_schemeless_and_special_links(self):
+        text = ("go example.com/path and sub.example.org "
+                "plus tg://resolve?domain=somechannel "
+                "and mailto:someone@example.net, "
+                "version v1.4.2 and file telegram.py stay")
+        clean = telegram.strip_urls(text)
+        self.assertNotIn("example.com", clean)
+        self.assertNotIn("example.org", clean)
+        self.assertNotIn("tg://", clean)
+        self.assertNotIn("mailto:", clean)
+        self.assertNotIn("example.net", clean)
+        self.assertIn("v1.4.2", clean)
+        self.assertIn("telegram.py stay", clean)
+        self.assertEqual(clean.count("[link removed]"), 4)
+
     def test_send_strip_urls_flag(self):
         with mock.patch.object(telegram, "call",
                                return_value={"ok": True}) as m:

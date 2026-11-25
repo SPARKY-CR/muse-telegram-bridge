@@ -422,7 +422,16 @@ def sanitize_html(text):
 
 
 _BARE_URL_RE = re.compile(
-    r"(?:https?://|www\.|t\.me/)[^\s<>\"]+", re.IGNORECASE)
+    r"(?:https?://|tg://|mailto:|www\.|t\.me/)[^\s<>\"]+"
+    r"|(?<![\w@.\-])(?:[a-z0-9\-]+\.)+"
+    r"(?:com|org|net|io|me|co|ir|info|biz|dev|app|site|online|xyz|top|"
+    r"ai|gg|tv|cc|us|uk|de|fr|ru|cn|jp|in|br|au|ca|it|es|nl|se|no|fi|"
+    r"dk|pl|tr|ae|sa|qa|kw|eg|pk|id|my|sg|hk|tw|kr|vn|th|ph|nz|za|mx|"
+    r"ar|cl|pe|ve|ua|cz|at|ch|be|pt|gr|hu|ro|bg|hr|sk|si|lt|lv|ee|ie|"
+    r"il|kz|uz|az|ge|am|by|md|rs|ba|mk|al|mt|cy|lu|eu|gov|edu|mil|"
+    r"int|museum|name|pro|mobi|travel|jobs|asia|tel|cat|coop|aero|"
+    r"arpa|onion)\b(?:/[^\s<>\"]*)?",
+    re.IGNORECASE)
 
 
 def strip_urls(text):

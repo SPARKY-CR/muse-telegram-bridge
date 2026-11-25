@@ -277,6 +277,12 @@ MUTATIONS = [
      "    if False:  # strip_urls_flag\n"
      "        text = strip_urls(text)",
      "test_telegram.TestParseMode.test_send_strip_urls_flag"),
+    ("strip-urls: schemeless and special schemes stripped",
+     "bin/telegram.py",
+     '    r"(?:https?://|tg://|mailto:|www\\.|t\\.me/)[^\\s<>\\"]+"',
+     '    r"(?:https?://|www\\.|t\\.me/)[^\\s<>\\"]+"',
+     "test_telegram.TestParseMode."
+     "test_strip_urls_removes_schemeless_and_special_links"),
     ("daily cap: counter increments persistently",
      "bin/telegram.py",
      "            daily_counts[daily_key] = daily_counts.get(daily_key, 0) + 1",
