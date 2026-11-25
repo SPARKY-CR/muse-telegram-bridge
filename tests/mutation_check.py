@@ -311,6 +311,29 @@ MUTATIONS = [
      "        if source_key is not None and derived_turn is None:",
      "test_telegram.TestUiStateLedgerSettings."
      "test_confirm_requires_source_key"),
+    ("voice: OGG magic bytes enforced",
+     "bin/telegram.py",
+     '    if magic != b"OggS":',
+     "    if False:  # magic != b\"OggS\"",
+     "test_telegram.TestSendVoice.test_voice_non_ogg_refused"),
+    ("voice: overlong text refused",
+     "bin/telegram.py",
+     "    if len(text) > MAX_VOICE_TEXT_CHARS:",
+     "    if False:  # len(text) > MAX_VOICE_TEXT_CHARS",
+     "test_telegram.TestVoiceReply."
+     "test_voice_reply_empty_and_overlong_refused"),
+    ("voice: temp files cleaned up",
+     "bin/telegram.py",
+     "        for path in (wav_path, ogg_path):\n"
+     "            if path:\n"
+     "                try:\n"
+     "                    os.unlink(path)",
+     "        for path in ():\n"
+     "            if path:\n"
+     "                try:\n"
+     "                    os.unlink(path)",
+     "test_telegram.TestVoiceReply."
+     "test_voice_reply_piper_failure_cleans_up"),
 ]
 
 

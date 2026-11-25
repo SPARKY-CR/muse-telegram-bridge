@@ -571,6 +571,176 @@ class TestSendDocument(TelegramTestCase):
         m.assert_not_called()
 
 
+class TestSendVoice(TelegramTestCase):
+    def _write_ogg(self, name="note.ogg", data=b"OggS-fake-opus"):
+        path = os.path.join(self.send_dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def _mock_upload_capture(self):
+        body = json.dumps(
+            {"ok": True, "result": {"message_id": 7}}).encode()
+        response = mock.MagicMock()
+        response.read.side_effect = [body, b""]
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        opener = mock.MagicMock()
+        opener.open.return_value = response
+        return mock.patch.object(urllib.request, "build_opener",
+                                 return_value=opener), opener
+
+    def test_voice_inside_allowed_dir_ok(self):
+        path = self._write_ogg()
+        patcher, opener = self._mock_upload_capture()
+        with patcher:
+            result = telegram.send_voice("111111111", path,
+                                         caption="hi", reply_to=3)
+        self.assertTrue(result["ok"])
+        request = opener.open.call_args[0][0]
+        self.assertIn(b'name="voice"', request.data)
+        self.assertIn(b'filename="note.ogg"', request.data)
+        self.assertIn(b'name="reply_to_message_id"', request.data)
+        self.assertFalse(os.path.exists(path))
+
+    def test_voice_non_ogg_refused(self):
+        path = self._write_ogg(data=b"not-ogg-data")
+        with self.assertRaises(ValueError):
+            telegram.send_voice("111111111", path)
+
+    def test_voice_symlink_refused(self):
+        target = self._write_ogg("target.ogg")
+        link = os.path.join(self.send_dir, "link.ogg")
+        os.symlink(target, link)
+        with self.assertRaises(ValueError):
+            telegram.send_voice("111111111", link)
+        self.assertTrue(os.path.exists(target))
+
+    def test_voice_outside_allowed_dir_refused(self):
+        outside = os.path.join(self.tmp.name, "outside.ogg")
+        with open(outside, "wb") as f:
+            f.write(b"OggS-fake")
+        with self.assertRaises(ValueError):
+            telegram.send_voice("111111111", outside)
+
+    def test_voice_oversize_refused(self):
+        path = os.path.join(self.send_dir, "big.ogg")
+        with open(path, "wb") as f:
+            f.write(b"OggS")
+            f.truncate(telegram.MAX_VOICE_BYTES + 1)
+        with self.assertRaises(ValueError):
+            telegram.send_voice("111111111", path)
+
+    def test_cli_send_voice_arbitrary_chat_refused(self):
+        with mock.patch.dict(os.environ,
+                             {"BRIDGE_CHAT_ID": "111111111"}), \
+                mock.patch.object(telegram, "send_voice",
+                                  return_value={"ok": True}) as m:
+            code = telegram.main(
+                ["send_voice", "999999999", "note.ogg"])
+        self.assertEqual(code, 1)
+        m.assert_not_called()
+
+
+class TestVoiceReply(TelegramTestCase):
+    def setUp(self):
+        super().setUp()
+        self.voices_dir = os.path.join(self.tmp.name, "voices")
+        os.makedirs(self.voices_dir)
+        for name in telegram.PIPER_VOICES.values():
+            with open(os.path.join(self.voices_dir, name), "wb") as f:
+                f.write(b"fake-model")
+        self.patch_voices = mock.patch.dict(
+            os.environ, {"PIPER_VOICES_DIR": self.voices_dir})
+        self.patch_voices.start()
+
+    def tearDown(self):
+        self.patch_voices.stop()
+        super().tearDown()
+
+    def _fake_run(self, fail_piper=False):
+        calls = []
+
+        def run(cmd, input=None, capture_output=True, timeout=None):
+            calls.append((cmd, input))
+            result = mock.MagicMock()
+            result.returncode = 0
+            result.stderr = b""
+            if "-m" in cmd and "piper" in cmd:
+                if fail_piper:
+                    result.returncode = 1
+                    result.stderr = b"piper boom"
+                    return result
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"RIFF-fake-wav")
+            else:
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"OggS-fake-opus")
+            return result
+
+        return run, calls
+
+    def test_voice_reply_fa_synthesizes_and_cleans_up(self):
+        run, calls = self._fake_run()
+        with mock.patch.object(telegram.subprocess, "run",
+                               side_effect=run), \
+                mock.patch.object(
+                    telegram, "call_multipart",
+                    return_value={"ok": True,
+                                  "result": {"message_id": 8}}) as m:
+            result = telegram.voice_reply(
+                "111111111", "fa", "سلام دنیا")
+        self.assertTrue(result["ok"])
+        method, fields, file_field = m.call_args[0][:3]
+        self.assertEqual(method, "sendVoice")
+        self.assertEqual(file_field, "voice")
+        self.assertEqual(fields["chat_id"], "111111111")
+        piper_cmd, piper_input = calls[0]
+        self.assertIn("fa_IR-ganji-medium.onnx", piper_cmd[4])
+        self.assertEqual(piper_input, "سلام دنیا".encode("utf-8"))
+        self.assertEqual(os.listdir(self.send_dir), [])
+
+    def test_voice_reply_en_uses_english_voice(self):
+        run, calls = self._fake_run()
+        with mock.patch.object(telegram.subprocess, "run",
+                               side_effect=run), \
+                mock.patch.object(
+                    telegram, "call_multipart",
+                    return_value={"ok": True}):
+            telegram.voice_reply("111111111", "en", "hello")
+        self.assertIn("en_US-lessac-medium.onnx", calls[0][0][4])
+
+    def test_voice_reply_bad_lang_refused(self):
+        with self.assertRaises(ValueError):
+            telegram.voice_reply("111111111", "de", "hallo")
+
+    def test_voice_reply_empty_and_overlong_refused(self):
+        with self.assertRaises(ValueError):
+            telegram.voice_reply("111111111", "fa", "   ")
+        with self.assertRaises(ValueError):
+            telegram.voice_reply(
+                "111111111", "fa",
+                "x" * (telegram.MAX_VOICE_TEXT_CHARS + 1))
+
+    def test_voice_reply_piper_failure_cleans_up(self):
+        run, _calls = self._fake_run(fail_piper=True)
+        with mock.patch.object(telegram.subprocess, "run",
+                               side_effect=run):
+            with self.assertRaises(RuntimeError):
+                telegram.voice_reply("111111111", "fa", "سلام")
+        self.assertEqual(os.listdir(self.send_dir), [])
+
+    def test_cli_voice_reply_arbitrary_chat_refused(self):
+        with mock.patch.dict(os.environ,
+                             {"BRIDGE_CHAT_ID": "111111111"}), \
+                mock.patch.object(telegram, "voice_reply",
+                                  return_value={"ok": True}) as m:
+            code = telegram.main(
+                ["voice_reply", "999999999", "hi", "--lang", "en"])
+        self.assertEqual(code, 1)
+        m.assert_not_called()
+
+
 class TestBridgeStatus(unittest.TestCase):
     def _runtime(self, d):
         with open(os.path.join(d, "poller-state.json"), "w") as f:

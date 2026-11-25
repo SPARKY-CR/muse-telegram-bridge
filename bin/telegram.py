@@ -55,6 +55,10 @@ Usage:
                                       [--parse-mode HTML]
   telegram.py send_document <chat_id> <document_path> [caption]
                                       [--parse-mode HTML]
+  telegram.py send_voice <chat_id> <voice_path> [caption]
+                                      [--parse-mode HTML] [--reply-to ID]
+  telegram.py voice_reply <chat_id> <text|-> --lang fa|en
+                                      [--caption TEXT] [--reply-to ID]
   telegram.py chat_action <chat_id> [action]
   telegram.py react <chat_id> <message_id> <emoji>
   telegram.py answer_callback <callback_query_id> [text]
@@ -82,6 +86,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -127,6 +132,16 @@ def _bridge_runtime_dir():
     return os.environ.get("BRIDGE_DIR") or os.path.join(REPO_DIR, "runtime")
 
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024  # 50 MB per sent document
+MAX_VOICE_BYTES = 10 * 1024 * 1024  # 10 MB per sent voice note
+MAX_VOICE_TEXT_CHARS = 1000  # voice replies stay short
+
+# Local Piper voices for voice_reply. PIPER_PYTHON defaults to
+# ~/workspace/piper-venv/bin/python when present, else the current
+# interpreter; PIPER_VOICES_DIR defaults to ~/workspace/models/piper.
+PIPER_VOICES = {
+    "fa": "fa_IR-ganji-medium.onnx",
+    "en": "en_US-lessac-medium.onnx",
+}
 
 # Predefined inline keyboards, so callers never hand-write JSON
 # (and never hit shell-quoting bugs like an apostrophe in a label).
@@ -551,7 +566,8 @@ def call_multipart(method, fields, file_field, file_path, timeout=120,
     if max_bytes is None:
         max_bytes = (bridge_common.MAX_PHOTO_BYTES if require_image
                      else MAX_DOCUMENT_BYTES)
-    command = "send_photo" if require_image else "send_document"
+    command = {"photo": "send_photo",
+               "voice": "send_voice"}.get(file_field, "send_document")
     allowed = _send_dirs()
     real = None
     for base in allowed:
@@ -891,6 +907,168 @@ def send_document(chat_id, document_path, caption=None,
         except OSError:
             pass
     return result
+
+
+def _validate_voice_path(voice_path):
+    """Resolve a voice path under the send/outbox allow-list.
+    Symlinks are refused, the file must be a regular OGG file
+    (OggS magic bytes) under the voice size cap."""
+    if os.path.islink(voice_path):
+        raise ValueError(
+            "send_voice refused: %r is a symlink" % voice_path)
+    allowed = _send_dirs()
+    real = None
+    for base in allowed:
+        try:
+            real = bridge_common.validate_inside(base, voice_path)
+            break
+        except ValueError:
+            continue
+    if real is None:
+        raise ValueError(
+            "send_voice refused: %r is outside the allowed "
+            "directories %s" % (voice_path, allowed))
+    try:
+        mode = os.lstat(real).st_mode
+    except OSError as exc:
+        raise ValueError(
+            "send_voice refused: cannot stat %r" % voice_path
+        ) from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError(
+            "send_voice refused: %r is not a regular file"
+            % voice_path)
+    if os.path.getsize(real) > MAX_VOICE_BYTES:
+        raise ValueError(
+            "send_voice refused: %d bytes exceeds the %d byte cap"
+            % (os.path.getsize(real), MAX_VOICE_BYTES))
+    with open(real, "rb") as f:
+        magic = f.read(4)
+    if magic != b"OggS":
+        raise ValueError(
+            "send_voice refused: %r is not an OGG file" % voice_path)
+    return real
+
+
+def send_voice(chat_id, voice_path, caption=None, parse_mode=None,
+               reply_to=None):
+    """Send an OGG/Opus voice note from the send/outbox
+    allow-list (10 MB cap, regular files only, no symlinks).
+    The outbox copy is deleted after a successful send. An HTML
+    caption rejected for entity parsing retries once as plain
+    stripped text."""
+    if parse_mode not in (None, "HTML"):
+        raise ValueError(f"unsupported parse_mode: {parse_mode!r}")
+    real = _validate_voice_path(voice_path)
+    fields = _caption_fields(chat_id, caption, parse_mode)
+    if reply_to is not None:
+        fields["reply_to_message_id"] = reply_to
+        fields["allow_sending_without_reply"] = "true"
+    try:
+        result = call_multipart(
+            "sendVoice", fields, "voice", real,
+            max_bytes=MAX_VOICE_BYTES, require_image=False)
+    except urllib.error.HTTPError as exc:
+        if parse_mode != "HTML" or not caption \
+                or not is_parse_entity_error(exc):
+            raise
+        plain_fields = _caption_fields(
+            chat_id, strip_html_tags(caption))
+        if reply_to is not None:
+            plain_fields["reply_to_message_id"] = reply_to
+            plain_fields["allow_sending_without_reply"] = "true"
+        result = call_multipart(
+            "sendVoice", plain_fields, "voice", real,
+            max_bytes=MAX_VOICE_BYTES, require_image=False)
+    if isinstance(result, dict) and result.get("ok"):
+        try:
+            os.unlink(real)
+        except OSError:
+            pass
+    return result
+
+
+def _piper_python():
+    """Piper interpreter: PIPER_PYTHON, else the piper venv
+    under ~/workspace, else the current interpreter."""
+    env = os.environ.get("PIPER_PYTHON", "").strip()
+    if env:
+        return env
+    venv = os.path.expanduser(
+        "~/workspace/piper-venv/bin/python")
+    return venv if os.path.isfile(venv) else sys.executable
+
+
+def _piper_voice_path(lang):
+    """Resolve the Piper voice model for a language."""
+    name = PIPER_VOICES.get(lang)
+    if name is None:
+        raise ValueError(
+            "voice_reply refused: unsupported lang %r "
+            "(expected fa or en)" % lang)
+    voices_dir = os.environ.get(
+        "PIPER_VOICES_DIR",
+        os.path.expanduser("~/workspace/models/piper"))
+    path = os.path.join(voices_dir, name)
+    if not os.path.isfile(path):
+        raise ValueError(
+            "voice_reply refused: Piper voice %r not found in %s"
+            % (name, voices_dir))
+    return path
+
+
+def voice_reply(chat_id, lang, text, caption=None, reply_to=None):
+    """Synthesize a short voice reply locally with Piper and
+    send it as a Telegram voice note. Persian text uses the
+    fa voice, English the en voice. Empty or overlong text is
+    refused. Temp WAV/OGG files live in the outbox and are
+    always cleaned up."""
+    if text is None or not str(text).strip():
+        raise ValueError("voice_reply refused: empty text")
+    text = str(text).strip()
+    if len(text) > MAX_VOICE_TEXT_CHARS:
+        raise ValueError(
+            "voice_reply refused: %d chars exceeds the %d char "
+            "cap" % (len(text), MAX_VOICE_TEXT_CHARS))
+    voice_path = _piper_voice_path(lang)
+    outbox = _send_dirs()[0]
+    os.makedirs(outbox, exist_ok=True)
+    wav_path = None
+    ogg_path = None
+    try:
+        fd, wav_path = tempfile.mkstemp(
+            prefix="voice-", suffix=".wav", dir=outbox)
+        os.close(fd)
+        fd, ogg_path = tempfile.mkstemp(
+            prefix="voice-", suffix=".ogg", dir=outbox)
+        os.close(fd)
+        piper = subprocess.run(
+            [_piper_python(), "-m", "piper", "-m", voice_path,
+             "-f", wav_path],
+            input=text.encode("utf-8"), capture_output=True,
+            timeout=120)
+        if piper.returncode != 0 or not os.path.getsize(wav_path):
+            raise RuntimeError(
+                "voice_reply failed: Piper synthesis failed: %s"
+                % piper.stderr.decode("utf-8", "replace")[:500])
+        ffmpeg = os.environ.get("FFMPEG_BIN", "ffmpeg")
+        conv = subprocess.run(
+            [ffmpeg, "-y", "-i", wav_path, "-c:a", "libopus",
+             "-b:a", "32k", "-ar", "48000", ogg_path],
+            capture_output=True, timeout=60)
+        if conv.returncode != 0 or not os.path.getsize(ogg_path):
+            raise RuntimeError(
+                "voice_reply failed: ffmpeg conversion failed: %s"
+                % conv.stderr.decode("utf-8", "replace")[:500])
+        return send_voice(chat_id, ogg_path, caption=caption,
+                          reply_to=reply_to)
+    finally:
+        for path in (wav_path, ogg_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def set_commands():
@@ -1796,6 +1974,30 @@ def main(argv=None):
     p_doc.add_argument("--parse-mode", default=None, choices=["HTML"],
                        help="Format the caption as Telegram HTML")
 
+    p_voice = sub.add_parser("send_voice",
+                             help="Send an OGG voice note from a file")
+    p_voice.add_argument("chat_id")
+    p_voice.add_argument("voice_path")
+    p_voice.add_argument("caption", nargs="?", default=None)
+    p_voice.add_argument("--parse-mode", default=None,
+                         choices=["HTML"],
+                         help="Format the caption as Telegram HTML")
+    p_voice.add_argument("--reply-to", type=int, default=None,
+                         help="Message id to reply to")
+
+    p_vreply = sub.add_parser(
+        "voice_reply",
+        help="Synthesize a short Piper voice reply and send it")
+    p_vreply.add_argument("chat_id")
+    p_vreply.add_argument("text",
+                          help="Text to speak, or - to read stdin")
+    p_vreply.add_argument("--lang", required=True,
+                          choices=["fa", "en"],
+                          help="fa for Persian, en for English")
+    p_vreply.add_argument("--caption", default=None)
+    p_vreply.add_argument("--reply-to", type=int, default=None,
+                          help="Message id to reply to")
+
     p_action = sub.add_parser(
         "chat_action",
         help="Show a chat action such as typing (lasts about 5 seconds)")
@@ -2004,6 +2206,20 @@ def main(argv=None):
             result = send_document(args.chat_id, args.document_path,
                                    caption=args.caption,
                                    parse_mode=args.parse_mode)
+        elif args.command == "send_voice":
+            require_allowed_chat(args.chat_id, "send_voice")
+            result = send_voice(args.chat_id, args.voice_path,
+                                caption=args.caption,
+                                parse_mode=args.parse_mode,
+                                reply_to=args.reply_to)
+        elif args.command == "voice_reply":
+            require_allowed_chat(args.chat_id, "voice_reply")
+            text = args.text
+            if text == "-":
+                text = sys.stdin.read()
+            result = voice_reply(args.chat_id, args.lang, text,
+                                 caption=args.caption,
+                                 reply_to=args.reply_to)
         elif args.command == "chat_action":
             require_allowed_chat(args.chat_id, "chat_action")
             result = call("sendChatAction",
